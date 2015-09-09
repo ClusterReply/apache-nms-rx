@@ -11,7 +11,6 @@ namespace Apache.NMS.Reactive
 {
     public class Observable<T> : ObservableBase<T>, IDisposable where T : IMessage
     {
-        
 
         SynchronizedCollection<IObserver<T>> _observerList = new SynchronizedCollection<IObserver<T>>();
 
@@ -19,29 +18,40 @@ namespace Apache.NMS.Reactive
         ISession session ;
         IMessageConsumer consumer;
 
-        public Observable(Uri address, string destinationName)
+        protected internal Observable(Uri address, string destinationName) : this(new NMSConnectionFactory(address),destinationName)
         {
             Contract.Requires<ArgumentNullException>(address != null);
-            Contract.Requires<ArgumentException>(!String.IsNullOrEmpty( destinationName));
+            Contract.Requires<ArgumentException>(!String.IsNullOrEmpty(destinationName));
+        }
+
+        protected internal Observable(IConnectionFactory factory, string destinationName)
+        {
+            Contract.Requires<ArgumentNullException>(factory != null);
+            Contract.Requires<ArgumentException>(!String.IsNullOrEmpty(destinationName));
             Contract.Ensures(connection.IsStarted);
 
             // Create a Factory
-            IConnectionFactory factory = new NMSConnectionFactory(address);
 
             connection = factory.CreateConnection();
-            session = connection.CreateSession();            
+            session = connection.CreateSession();
             IDestination destination = SessionUtil.GetDestination(session, destinationName);
-
+            connection.ExceptionListener += connection_ExceptionListener;
             consumer = session.CreateConsumer(destination);
 
             consumer.Listener += consumer_Listener;
 
             connection.Start();
-
-            
         }
 
-        void consumer_Listener(IMessage message)
+        private void connection_ExceptionListener(Exception exception)
+        {
+            Contract.Ensures(_observerList.Count == 0);
+
+            _observerList.ToList().ForEach(item => item.OnError(exception));
+        }
+        
+
+        private void consumer_Listener(IMessage message)
         {
             Contract.Requires(message is T);
             Contract.Requires(_observerList != null);
@@ -53,18 +63,22 @@ namespace Apache.NMS.Reactive
             }
             catch(Exception err)
             {
-                foreach (var item in _observerList)
-                { 
-                    item.OnError(err);
-                }
-                _observerList.Clear();
+                _observerList.ToList().ForEach(item => item.OnError(err));
             }
 
-            foreach (var item in _observerList)
+
+            _observerList.ToList().ForEach(item =>
             {
-                item.OnNext(msg);
-            }
-            // TODO : Cosa succede se la OnNext solleva errore?
+                try { item.OnNext(msg); }
+                catch (Exception err)
+                {                         
+                    // If OnNext raised an exception it means that a single observer has a problem, it not needs to bother other observer nor to stop further event processing.
+                    // HACK: Sostituire con metodo leggero di logging (maybe Observable<Exception>?)
+                    System.Diagnostics.Trace.WriteLine(err.ToString());
+                }
+            });
+
+                
         }
 
         protected override IDisposable SubscribeCore(IObserver<T> observer)
@@ -73,8 +87,9 @@ namespace Apache.NMS.Reactive
 
             Contract.Assume(observer != null);
 
-            _observerList.Add(observer);
-            return System.Reactive.Disposables.Disposable.Create(() => _observerList.Remove(observer));
+                _observerList.Add(observer);
+
+            return System.Reactive.Disposables.Disposable.Create(() => {  _observerList.Remove(observer); });
         }
 
         public void Dispose()
@@ -97,12 +112,7 @@ namespace Apache.NMS.Reactive
                     connection.Dispose();
                     consumer.Dispose();
 
-                    foreach (var item in _observerList)
-                    {
-                        item.OnCompleted();
-                    }
-
-                    _observerList.Clear();
+                    _observerList.ToList().ForEach(item => item.OnCompleted());
 
                 }
 
@@ -111,5 +121,8 @@ namespace Apache.NMS.Reactive
         }
 
         private bool disposed = false;
+
+
+
     }
 }
